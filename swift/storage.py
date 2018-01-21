@@ -6,6 +6,8 @@ from functools import wraps
 from io import BytesIO, UnsupportedOperation
 from time import time
 import magic
+import iso8601
+import pytz
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.core.files import File
@@ -141,11 +143,10 @@ class SwiftStorage(Storage):
     os_extra_options = setting('SWIFT_EXTRA_OPTIONS', {})
     auto_overwrite = setting('SWIFT_AUTO_OVERWRITE', False)
     content_type_from_fd = setting('SWIFT_CONTENT_TYPE_FROM_FD', False)
-    _token_creation_time = 0
-    _token = ''
     name_prefix = setting('SWIFT_NAME_PREFIX', '')
     full_listing = setting('SWIFT_FULL_LISTING', True)
     max_retries = setting('SWIFT_MAX_RETRIES', 5)
+    preload_metadata = setting('SWIFT_PRELOAD_METADATA', False)
 
     def __init__(self, **settings):
         # check if some of the settings provided as class attributes
@@ -158,6 +159,9 @@ class SwiftStorage(Storage):
 
         self.last_headers_name = None
         self.last_headers_value = None
+
+        self._loaded_headers = {}
+        self._loaded_meta = False
 
         self.os_options = {
             'tenant_id': self.tenant_id,
@@ -218,6 +222,25 @@ class SwiftStorage(Storage):
         else:
             self.base_url = self.override_base_url
 
+    @property
+    def preloaded_meta(self):
+        """
+        Get the locally cached headers of objects for the container.
+        """
+        if self.preload_metadata and not self._loaded_meta:
+            container = self.swift_conn.get_container(self.container_name, full_listing=False,
+                                                      prefix=self.name_prefix)
+            self._loaded_headers.update({
+                obj['name']: dict(size=int(obj['bytes']),
+                                  # todo !!! fix the timezone hack
+                                  modified_time=iso8601.parse_date(obj['last_modified']).astimezone(
+                                      pytz.timezone('Europe/Moscow')).replace(tzinfo=None))
+                for obj in container[1]
+            })
+            self._loaded_meta = True
+
+        return self._loaded_headers
+
     def _open(self, name, mode='rb'):
         original_name = name
         name = self.name_prefix + name
@@ -248,12 +271,16 @@ class SwiftStorage(Storage):
         else:
             content_type = mimetypes.guess_type(name)[0]
         content_length = content.size
+        modified_time = datetime.now()
         self.swift_conn.put_object(self.container_name,
                                    name,
                                    content,
                                    content_length=content_length,
                                    content_type=content_type,
                                    headers=headers)
+        if self.preload_metadata:
+            self._loaded_headers[name] = dict(size=int(content_length),
+                                              modified_time=modified_time)
         return original_name
 
     def get_headers(self, name):
@@ -271,10 +298,21 @@ class SwiftStorage(Storage):
             self.last_headers_name = name
         return self.last_headers_value
 
+    def get_metadata(self, name):
+        if name in self.preloaded_meta:
+            return self.preloaded_meta[name]
+        headers = self.get_headers(name)
+        metadata = dict(size=int(headers['content-length']),
+                        modified_time=datetime.fromtimestamp(
+                            float(headers['x-timestamp'])))
+        if self.preload_metadata:
+            self._loaded_headers[name] = metadata
+        return metadata
+
     @prepend_name_prefix
     def exists(self, name):
         try:
-            self.get_headers(name)
+            self.get_metadata(name)
         except swiftclient.ClientException:
             return False
         return True
@@ -283,6 +321,7 @@ class SwiftStorage(Storage):
     def delete(self, name):
         try:
             self.swift_conn.delete_object(self.container_name, name)
+            self._loaded_headers.pop(name, None)
         except swiftclient.ClientException:
             pass
 
@@ -314,12 +353,11 @@ class SwiftStorage(Storage):
 
     @prepend_name_prefix
     def size(self, name):
-        return int(self.get_headers(name)['content-length'])
+        return self.get_metadata(name)['size']
 
     @prepend_name_prefix
     def modified_time(self, name):
-        return datetime.fromtimestamp(
-            float(self.get_headers(name)['x-timestamp']))
+        return self.get_metadata(name)['modified_time']
 
     @prepend_name_prefix
     def url(self, name):
@@ -373,7 +411,7 @@ class SwiftStorage(Storage):
 
     @prepend_name_prefix
     def rmtree(self, abs_path):
-        container = self.swift_conn.get_container(self.container_name)
+        container = self.swift_conn.get_container(self.container_name, prefix=self.name_prefix)
 
         for obj in container[1]:
             if obj['name'].startswith(abs_path):
@@ -385,6 +423,7 @@ class StaticSwiftStorage(SwiftStorage):
     container_name = setting('SWIFT_STATIC_CONTAINER_NAME', '')
     name_prefix = setting('SWIFT_STATIC_NAME_PREFIX', '')
     override_base_url = setting('SWIFT_STATIC_BASE_URL')
+    preload_metadata = setting('SWIFT_STATIC_PRELOAD_METADATA', False)
 
     def get_available_name(self, name, max_length=None):
         """
